@@ -1,0 +1,124 @@
+syntax = "proto3";
+
+package raftkv.v1;
+
+option go_package = "github.com/Nirmal-22/raft-kv/internal/pb";
+
+// Command is one entry in the replicated Raft log. Every node applies the same
+// commands in the same order, which is what keeps the copies identical.
+message Command {
+  oneof op {
+    Put put = 1;
+    Delete delete = 2;
+    Expire expire = 3;
+    SetMember set_member = 4;
+    RemoveMember remove_member = 5;
+  }
+}
+
+message Put {
+  string key = 1;
+  bytes value = 2;
+  // Absolute expiry time chosen by the leader when it proposes the command.
+  // Zero means the key never expires.
+  int64 expires_at_ms = 3;
+  // Compare-and-swap: when set, the write only happens if the key's current
+  // version equals this value. Zero means "the key must not exist".
+  optional uint64 if_version = 4;
+  // Time-to-live as the client asked for it. The leader turns this into
+  // expires_at_ms using its own clock just before proposing, then clears it,
+  // so only one clock ever decides when a key expires.
+  int64 ttl_ms = 5;
+}
+
+message Delete {
+  string key = 1;
+  optional uint64 if_version = 2;
+}
+
+// Expire removes every key whose expiry time is at or before now_ms. The
+// leader proposes it, so no node ever consults its own clock to decide whether
+// a key is alive. That keeps expiry deterministic across replicas.
+message Expire {
+  int64 now_ms = 1;
+}
+
+// Member records how to reach a node. It lives in the replicated state so any
+// node can find the leader's gRPC address and forward requests to it.
+message Member {
+  string id = 1;
+  string raft_addr = 2;
+  string grpc_addr = 3;
+  string http_addr = 4;
+}
+
+message SetMember {
+  Member member = 1;
+}
+
+message RemoveMember {
+  string id = 1;
+}
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_OK = 1;
+  STATUS_NOT_FOUND = 2;
+  STATUS_VERSION_MISMATCH = 3;
+}
+
+message ApplyResult {
+  Status status = 1;
+  // Version of the key after the command. A key's version is the Raft log
+  // index of the last command that changed it.
+  uint64 version = 2;
+  // On STATUS_VERSION_MISMATCH: the version the key actually has.
+  uint64 current_version = 3;
+  // Number of keys removed by an Expire command.
+  uint32 expired = 4;
+}
+
+message GetRequest {
+  string key = 1;
+}
+
+message GetResponse {
+  bool found = 1;
+  bytes value = 2;
+  uint64 version = 3;
+  int64 expires_at_ms = 4;
+}
+
+message ListRequest {
+  string prefix = 1;
+  uint32 limit = 2;
+}
+
+message KeyInfo {
+  string key = 1;
+  uint64 version = 2;
+  int64 expires_at_ms = 3;
+}
+
+message ListResponse {
+  repeated KeyInfo keys = 1;
+}
+
+message JoinRequest {
+  Member member = 1;
+  // Set when one node passes the request on to the leader, so it is never
+  // passed on twice.
+  bool forwarded = 2;
+}
+
+message JoinResponse {}
+
+// Cluster is the node-to-node API. Apply, Get and List are only ever sent to
+// the node the caller believes is the leader; a node that is not the leader
+// answers FAILED_PRECONDITION instead of forwarding again.
+service Cluster {
+  rpc Apply(Command) returns (ApplyResult);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc List(ListRequest) returns (ListResponse);
+  rpc Join(JoinRequest) returns (JoinResponse);
+}
