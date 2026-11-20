@@ -80,7 +80,7 @@ Every node serves the same HTTP API on its `--http` address.
 | `GET /v1/kv/{key}?consistency=stale` | Answer from this node's own copy: faster, works without a leader, may be behind. |
 | `DELETE /v1/kv/{key}` | Delete. Accepts `if_version` too. |
 | `GET /v1/keys?prefix=&limit=` | List keys under a prefix, with versions. |
-| `GET /v1/watch?prefix=` | Server-Sent Events stream of `put`, `delete` and `expire` events. |
+| `GET /v1/watch?prefix=` | Server-Sent Events stream of `put`, `delete` and `expire` events. A value that is not valid UTF-8 arrives as `value_base64`. A final `dropped` event means events were missed: re-read and reconnect. |
 | `GET /v1/cluster` | Leader, term, log positions and members as this node sees them. |
 | `DELETE /v1/cluster/members/{id}` | Remove a node. Must be sent to the leader (`421` otherwise, with the leader's address). |
 | `GET /metrics`, `/healthz`, `/readyz` | Prometheus metrics; liveness; ready once a leader is known. |
@@ -113,18 +113,33 @@ it has been replaced, the marker never reaches a majority and the read fails ins
 returning stale data (`getLocal` in `internal/node/node.go`). `consistency=stale` skips all of
 this and reads the contacted node's own copy.
 
+**Storage layout.** A key's value is stored with a 16-byte header (version and expiry time). The
+same header is also kept in a small separate index, because Pebble stores a value next to its
+key: anything that only needs versions (listing, compare-and-swap, expiry) would otherwise load
+every value from disk.
+
 **Applying a command exactly once per node.** Each command is applied in one Pebble batch
 together with its log index (`Store.Apply` in `internal/store/store.go`). After a restart Raft
 replays entries the store may already contain; anything at or below the stored index is
 skipped. Without that, a replayed compare-and-swap would be judged against newer state and the
 copies could drift apart. It also means the store does not need to fsync: if it loses its last
-few commands in a crash, the fsynced Raft log replays exactly those.
+few commands in a crash, the node brings it forward again on restart.
+
+**Restart.** Raft's default is to reload the newest snapshot into the state machine on every
+start, which would wipe and rebuild the whole store and make restart time grow with the data.
+The store is on disk and knows the last index it applied, so the node skips the reload when the
+store is at or past the snapshot and just replays the log after it (`startRaft` in
+`internal/node/node.go`). It still reloads when the store is behind the snapshot, because the
+log entries that would fill the gap may already have been compacted away.
 
 **TTL without clocks disagreeing.** Nodes never check their own clock to decide whether a key
 has expired, because three clocks give three answers. The leader stamps the expiry time when it
-proposes the write, and later proposes an `Expire(now)` command; every node deletes the same
-keys when it applies that command. A sorted expiry index makes this touch only the keys that are
-due. The cost: a key can outlive its TTL by up to one tick (1 s by default).
+proposes the write, and later proposes `Expire(now, max_keys)` commands; every node deletes the
+same keys when it applies one. A sorted expiry index makes this touch only the keys that are
+due, and each command removes at most 1,000 of them, so a large backlog is cleared in many small
+steps instead of one that stalls every node. The costs: a key can outlive its TTL by up to one
+tick (1 s by default), and after a change of leader a key can expire early or late by the two
+leaders' clock difference.
 
 **Snapshots.** The log is compacted into a snapshot of the store (a frozen Pebble view,
 streamed out while writes continue). A node that is too far behind, or brand new, is sent the
@@ -132,7 +147,11 @@ snapshot and then the log entries after it.
 
 **Membership.** A new node asks any existing node to add it; that node passes the request to
 the leader. Each node's addresses are stored in the replicated state, which is how a follower
-finds the leader's gRPC address.
+finds the leader's gRPC address. The leader can remove any node, including itself.
+
+**Watch.** Events come from the node you are connected to, as it applies commands. When that
+node loads a snapshot its state jumps without per-key events, so it ends every watch stream
+with a `dropped` event rather than let a client believe it saw everything.
 
 **Wire format.** Log entries and node-to-node calls are Protocol Buffers
 (`proto/kv.proto`). The generated code is committed, so building needs only Go.
@@ -150,17 +169,19 @@ finds the leader's gRPC address.
 
 ## Testing
 
-`make test` runs 26 tests; `make race` runs them under Go's race detector, which is what CI
+`make test` runs 35 tests; `make race` runs them under Go's race detector, which is what CI
 does.
 
-- **Store** (8): put/get/delete, compare-and-swap, TTL, listing, snapshot and restore, watch,
+- **Store** (12): put/get/delete, compare-and-swap, TTL and bounded expiry, listing without
+  reading values, the metadata index staying in step with the data, snapshot and restore, watch,
   and that replayed log entries are skipped.
 - **HTTP** (7): the real handler in front of a one-node cluster, including the event stream and
   `/metrics`.
-- **Cluster** (11): real 3-node clusters inside the test process. Real Raft over TCP, real gRPC,
+- **Cluster** (16): real 3-node clusters inside the test process. Real Raft over TCP, real gRPC,
   real files; only the timeouts are shortened. They cover forwarding, a leader crash, loss of
-  majority, a partitioned leader, a full restart, a new node catching up from a snapshot, TTL on
-  every node, and removing a member.
+  majority, a partitioned leader, restarts with and without a snapshot reload, a new node
+  catching up from a snapshot, TTL on every node and across a change of leader, a 4.5 MiB list
+  through a follower, and removing a member (including the leader removing itself).
 
 **The fault-injection run** (`internal/clustertest/linearizability_test.go`). Six clients read,
 write and delete for six seconds through randomly chosen nodes while the test repeatedly cuts
@@ -170,6 +191,13 @@ a single order of all operations that explains every result a client saw; if the
 store returned something a correct single-copy store never could. A typical run: about 3,000
 completed operations, 8 faults, verified in under 7 seconds. Writes whose outcome the client
 never learned are kept in the history as "may have happened at any later time", not dropped.
+
+**Compare-and-swap under faults** (`TestCompareAndSwapCounterUnderFaults`). The Porcupine model
+has no versions, so compare-and-swap gets its own check: five clients increment one counter with
+read-then-swap during the same partitions and restarts. At the end the counter must lie between
+the number of swaps the clients saw succeed and that number plus the swaps with an unknown
+outcome. A swap applied twice, lost, or accepted against a stale version breaks that. One run:
+380 acknowledged swaps, 14 unknown, counter at 384.
 
 **Does the test catch real bugs?** I broke the code on purpose and re-ran it:
 
@@ -192,11 +220,28 @@ tool that controls time, such as Jepsen or a deterministic simulator.
   was cut off survived, and the "isolated" leader kept its majority. The fix is in
   `internal/node/faultnet.go`.
 
+**Bugs found by reading the code afterwards**, each now fixed with a test that fails on the old
+code where that was checked:
+
+- A list sent to a follower failed once the reply passed gRPC's 4 MiB default, while the same
+  request to the leader worked (checked: `ResourceExhausted` at 4.5 MiB without the fix).
+- Listing read every value to get at the 16-byte header in front of it: 42 to 48 MiB allocated
+  to list 40 MiB of values, now under 4 MiB. The first fix (stop copying) was not enough, because
+  Pebble keeps a value next to its key and loads the whole value from disk either way. Versions
+  and expiry times now also live in a small separate index that List and the write path read.
+- One `Expire` command deleted every due key, however many.
+- The leader removing itself took effect but reported an error and stayed in the member table.
+  The first fix had a race of its own, which its test caught: the leader's background loop put
+  the entry back before the removal committed.
+- Every restart reloaded the whole snapshot.
+- A watcher silently missed everything a snapshot changed, and binary values were altered in
+  watch events.
+
 ## Observability
 
 - **Metrics** at `/metrics`: request latency by route and status, time to apply a command, read
   latency by consistency level, forwarded requests, leadership changes, expired keys, open
-  watchers, and Raft's term and log positions.
+  watchers, snapshot reloads, and Raft's term and log positions.
 - **Tracing** with OpenTelemetry: `kvd --trace stdout` prints spans; `--trace otlp` sends them to
   a collector. A write sent to a follower is one trace across two nodes (the follower's HTTP
   span is the parent of the leader's gRPC span). The stdout mode is verified; the OTLP mode
@@ -215,8 +260,8 @@ Things a real deployment would need, in rough order of importance:
   number recorded in the replicated state.
 - **One Raft group.** All data lives on every node, so capacity does not grow with nodes. Scaling
   out means sharding keys across several groups.
-- **Watch does not replay.** A watcher that disconnects misses events; there is no "resume from
-  version N".
+- **Watch does not replay.** A watcher that disconnects or is dropped misses events; there is no
+  "resume from version N".
 - **Listen address = advertised address.** Running behind NAT or in containers needs separate
   bind and advertise addresses.
 - **Removing a member is not forwarded** to the leader like other requests are.
@@ -239,3 +284,7 @@ scripts/cluster.sh       run a 3-node cluster locally
 
 `make proto` regenerates `internal/pb/` and needs `protoc` plus `protoc-gen-go` and
 `protoc-gen-go-grpc`. Nothing else in the build does.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).

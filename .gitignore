@@ -2,3 +2,4 @@ bin/
 data/
 *.test
 linearizability-violation.html
+CLAUDE.local.md
