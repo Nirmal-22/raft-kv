@@ -26,8 +26,9 @@ message Put {
   // version equals this value. Zero means "the key must not exist".
   optional uint64 if_version = 4;
   // Time-to-live as the client asked for it. The leader turns this into
-  // expires_at_ms using its own clock just before proposing, then clears it,
-  // so only one clock ever decides when a key expires.
+  // expires_at_ms using its own clock just before proposing, then clears it.
+  // Expiry is therefore decided by leaders' clocks only: after a change of
+  // leader, a key can expire early or late by the two leaders' clock skew.
   int64 ttl_ms = 5;
 }
 
@@ -41,6 +42,11 @@ message Delete {
 // a key is alive. That keeps expiry deterministic across replicas.
 message Expire {
   int64 now_ms = 1;
+  // Upper bound on expiry-index entries handled by this one command, so a
+  // backlog of expired keys is cleared in several small commands instead of
+  // one that stalls every node. Zero means no limit. The bound travels in the
+  // command (not in code) so every node applies exactly the same amount.
+  uint32 max_keys = 2;
 }
 
 // Member records how to reach a node. It lives in the replicated state so any

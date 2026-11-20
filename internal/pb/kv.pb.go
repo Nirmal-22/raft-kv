@@ -216,8 +216,9 @@ type Put struct {
 	// version equals this value. Zero means "the key must not exist".
 	IfVersion *uint64 `protobuf:"varint,4,opt,name=if_version,json=ifVersion,proto3,oneof" json:"if_version,omitempty"`
 	// Time-to-live as the client asked for it. The leader turns this into
-	// expires_at_ms using its own clock just before proposing, then clears it,
-	// so only one clock ever decides when a key expires.
+	// expires_at_ms using its own clock just before proposing, then clears it.
+	// Expiry is therefore decided by leaders' clocks only: after a change of
+	// leader, a key can expire early or late by the two leaders' clock skew.
 	TtlMs         int64 `protobuf:"varint,5,opt,name=ttl_ms,json=ttlMs,proto3" json:"ttl_ms,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -344,8 +345,13 @@ func (x *Delete) GetIfVersion() uint64 {
 // leader proposes it, so no node ever consults its own clock to decide whether
 // a key is alive. That keeps expiry deterministic across replicas.
 type Expire struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	NowMs         int64                  `protobuf:"varint,1,opt,name=now_ms,json=nowMs,proto3" json:"now_ms,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	NowMs int64                  `protobuf:"varint,1,opt,name=now_ms,json=nowMs,proto3" json:"now_ms,omitempty"`
+	// Upper bound on expiry-index entries handled by this one command, so a
+	// backlog of expired keys is cleared in several small commands instead of
+	// one that stalls every node. Zero means no limit. The bound travels in the
+	// command (not in code) so every node applies exactly the same amount.
+	MaxKeys       uint32 `protobuf:"varint,2,opt,name=max_keys,json=maxKeys,proto3" json:"max_keys,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -383,6 +389,13 @@ func (*Expire) Descriptor() ([]byte, []int) {
 func (x *Expire) GetNowMs() int64 {
 	if x != nil {
 		return x.NowMs
+	}
+	return 0
+}
+
+func (x *Expire) GetMaxKeys() uint32 {
+	if x != nil {
+		return x.MaxKeys
 	}
 	return 0
 }
@@ -1000,9 +1013,10 @@ const file_kv_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\"\n" +
 	"\n" +
 	"if_version\x18\x02 \x01(\x04H\x00R\tifVersion\x88\x01\x01B\r\n" +
-	"\v_if_version\"\x1f\n" +
+	"\v_if_version\":\n" +
 	"\x06Expire\x12\x15\n" +
-	"\x06now_ms\x18\x01 \x01(\x03R\x05nowMs\"o\n" +
+	"\x06now_ms\x18\x01 \x01(\x03R\x05nowMs\x12\x19\n" +
+	"\bmax_keys\x18\x02 \x01(\rR\amaxKeys\"o\n" +
 	"\x06Member\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1b\n" +
 	"\traft_addr\x18\x02 \x01(\tR\braftAddr\x12\x1b\n" +

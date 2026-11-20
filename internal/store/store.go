@@ -24,6 +24,7 @@ import (
 // apart and lets each be scanned on its own.
 const (
 	prefixData   = 'd' // d<key>            -> version | expiresAt | value
+	prefixMeta   = 'v' // v<key>            -> version | expiresAt; the same header, without the value
 	prefixExpiry = 'e' // e<expiresAt><key> -> empty; index of keys by expiry time
 	prefixMember = 'm' // m<node id>        -> pb.Member
 	prefixSystem = 's' // s<name>           -> internal bookkeeping
@@ -94,9 +95,11 @@ func (s *Store) Watch(prefix string) (<-chan Event, func()) { return s.hub.subsc
 // index is skipped. Without that check a replayed compare-and-swap would be
 // judged against newer state and the replicas could diverge.
 //
-// Because of that guarantee the batch does not need an fsync: if the machine
-// dies, the store loses a suffix of commands and the Raft log (which is
-// fsynced) replays exactly that suffix.
+// Because of that guarantee the batch does not need an fsync. If the machine
+// dies the store loses its most recent commands, and on restart the node
+// brings it forward again: by replaying the fsynced Raft log, or, when the
+// store has fallen behind the newest snapshot (whose log entries may already
+// be compacted away), by loading that snapshot first. See Node.startRaft.
 func (s *Store) Apply(index uint64, cmd *pb.Command) (*pb.ApplyResult, error) {
 	if index <= s.applied.Load() {
 		return &pb.ApplyResult{Status: pb.Status_STATUS_UNSPECIFIED}, nil
@@ -146,7 +149,7 @@ func (s *Store) Apply(index uint64, cmd *pb.Command) (*pb.ApplyResult, error) {
 }
 
 func (s *Store) applyPut(b *pebble.Batch, index uint64, p *pb.Put) (*pb.ApplyResult, []Event, error) {
-	cur, found, err := s.get(p.Key)
+	cur, found, err := s.stat(p.Key)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -164,7 +167,11 @@ func (s *Store) applyPut(b *pebble.Batch, index uint64, p *pb.Put) (*pb.ApplyRes
 			return nil, nil, err
 		}
 	}
-	if err := b.Set(dataKey(p.Key), encodeValue(index, p.ExpiresAtMs, p.Value), nil); err != nil {
+	encoded := encodeValue(index, p.ExpiresAtMs, p.Value)
+	if err := b.Set(dataKey(p.Key), encoded, nil); err != nil {
+		return nil, nil, err
+	}
+	if err := b.Set(metaKey(p.Key), encoded[:valueHeader], nil); err != nil {
 		return nil, nil, err
 	}
 	if p.ExpiresAtMs != 0 {
@@ -177,7 +184,7 @@ func (s *Store) applyPut(b *pebble.Batch, index uint64, p *pb.Put) (*pb.ApplyRes
 }
 
 func (s *Store) applyDelete(b *pebble.Batch, d *pb.Delete) (*pb.ApplyResult, []Event, error) {
-	cur, found, err := s.get(d.Key)
+	cur, found, err := s.stat(d.Key)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -196,6 +203,9 @@ func (s *Store) applyDelete(b *pebble.Batch, d *pb.Delete) (*pb.ApplyResult, []E
 	if err := b.Delete(dataKey(d.Key), nil); err != nil {
 		return nil, nil, err
 	}
+	if err := b.Delete(metaKey(d.Key), nil); err != nil {
+		return nil, nil, err
+	}
 	if cur.ExpiresAtMs != 0 {
 		if err := b.Delete(expiryKey(cur.ExpiresAtMs, d.Key), nil); err != nil {
 			return nil, nil, err
@@ -206,7 +216,9 @@ func (s *Store) applyDelete(b *pebble.Batch, d *pb.Delete) (*pb.ApplyResult, []E
 }
 
 // applyExpire walks the expiry index up to now and removes those keys. The
-// index is sorted by time, so this touches only keys that are actually due.
+// index is sorted by time, so this touches only keys that are actually due,
+// oldest first, and at most e.MaxKeys of them. Whatever is left stays in the
+// index for the next Expire command.
 func (s *Store) applyExpire(b *pebble.Batch, e *pb.Expire) (*pb.ApplyResult, []Event, error) {
 	it, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: []byte{prefixExpiry},
@@ -218,7 +230,12 @@ func (s *Store) applyExpire(b *pebble.Batch, e *pb.Expire) (*pb.ApplyResult, []E
 	defer it.Close()
 
 	var events []Event
+	handled := uint32(0)
 	for ok := it.First(); ok; ok = it.Next() {
+		if e.MaxKeys > 0 && handled >= e.MaxKeys {
+			break
+		}
+		handled++
 		k := it.Key()
 		if len(k) < 9 {
 			continue
@@ -228,7 +245,7 @@ func (s *Store) applyExpire(b *pebble.Batch, e *pb.Expire) (*pb.ApplyResult, []E
 		if err := b.Delete(append([]byte(nil), k...), nil); err != nil {
 			return nil, nil, err
 		}
-		cur, found, err := s.get(key)
+		cur, found, err := s.stat(key)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -236,6 +253,9 @@ func (s *Store) applyExpire(b *pebble.Batch, e *pb.Expire) (*pb.ApplyResult, []E
 			continue // the key was rewritten since; this index entry is stale
 		}
 		if err := b.Delete(dataKey(key), nil); err != nil {
+			return nil, nil, err
+		}
+		if err := b.Delete(metaKey(key), nil); err != nil {
 			return nil, nil, err
 		}
 		events = append(events, Event{Type: EventExpire, Key: key, Version: cur.Version})
@@ -277,11 +297,30 @@ func (s *Store) get(key string) (Entry, bool, error) {
 	return e, err == nil, err
 }
 
+// stat reads a key's version and expiry from the metadata index, without
+// touching its value. The write path and List only need those 16 bytes.
+//
+// The index exists because Pebble keeps a value next to its key: reading the
+// header at the front of a 1 MiB value loads the whole value from disk. List
+// used to do that for each of up to 10,000 keys, which could cost gigabytes.
+func (s *Store) stat(key string) (Entry, bool, error) {
+	raw, closer, err := s.db.Get(metaKey(key))
+	if errors.Is(err, pebble.ErrNotFound) {
+		return Entry{}, false, nil
+	}
+	if err != nil {
+		return Entry{}, false, err
+	}
+	defer closer.Close()
+	e, err := decodeHeader(raw)
+	return e, err == nil, err
+}
+
 // List returns keys that start with prefix, in order, without their values.
 func (s *Store) List(prefix string, limit int) ([]*pb.KeyInfo, error) {
 	s.restoreMu.RLock()
 	defer s.restoreMu.RUnlock()
-	lower := dataKey(prefix)
+	lower := metaKey(prefix)
 	it, err := s.db.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: prefixEnd(lower)})
 	if err != nil {
 		return nil, err
@@ -289,7 +328,7 @@ func (s *Store) List(prefix string, limit int) ([]*pb.KeyInfo, error) {
 	defer it.Close()
 	var out []*pb.KeyInfo
 	for ok := it.First(); ok && (limit <= 0 || len(out) < limit); ok = it.Next() {
-		e, err := decodeValue(it.Value())
+		e, err := decodeHeader(it.Value())
 		if err != nil {
 			return nil, err
 		}
@@ -457,6 +496,10 @@ func (s *Store) Restore(r io.Reader) error {
 		return err
 	}
 	s.applied.Store(idx)
+	// The store just jumped to a new state without going through Apply, so no
+	// per-key events exist for what changed. Cut every watcher off rather than
+	// let it believe it saw everything; it has to re-read and subscribe again.
+	s.hub.closeAll()
 	return nil
 }
 
@@ -479,6 +522,10 @@ func (s *Store) readApplied() (uint64, error) {
 
 func dataKey(key string) []byte {
 	return append([]byte{prefixData}, key...)
+}
+
+func metaKey(key string) []byte {
+	return append([]byte{prefixMeta}, key...)
 }
 
 func memberKey(id string) []byte {
@@ -514,15 +561,24 @@ func encodeValue(version uint64, expiresAtMs int64, value []byte) []byte {
 	return b
 }
 
-func decodeValue(raw []byte) (Entry, error) {
+// decodeHeader returns an Entry with Version and ExpiresAtMs set and no Value.
+func decodeHeader(raw []byte) (Entry, error) {
 	if len(raw) < valueHeader {
 		return Entry{}, fmt.Errorf("corrupt value (%d bytes)", len(raw))
 	}
 	return Entry{
 		Version:     binary.BigEndian.Uint64(raw[0:8]),
 		ExpiresAtMs: int64(binary.BigEndian.Uint64(raw[8:16])),
-		Value:       append([]byte(nil), raw[valueHeader:]...),
 	}, nil
+}
+
+func decodeValue(raw []byte) (Entry, error) {
+	e, err := decodeHeader(raw)
+	if err != nil {
+		return Entry{}, err
+	}
+	e.Value = append([]byte(nil), raw[valueHeader:]...)
+	return e, nil
 }
 
 // quietLogger drops Pebble's informational logging but keeps fatal errors.

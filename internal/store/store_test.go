@@ -2,6 +2,8 @@ package store
 
 import (
 	"bytes"
+	"fmt"
+	"runtime"
 	"testing"
 
 	"github.com/Nirmal-22/raft-kv/internal/pb"
@@ -256,5 +258,152 @@ func TestSlowWatcherIsDropped(t *testing.T) {
 	}
 	if n != watchBuffer {
 		t.Fatalf("got %d buffered events, want %d", n, watchBuffer)
+	}
+}
+
+// List needs versions, not values. It used to copy every value to get at the
+// 16-byte header in front of it, so listing large values cost their full size.
+func TestListDoesNotCopyValues(t *testing.T) {
+	s := newStore(t)
+	const keys, valueSize = 40, 1 << 20
+	big := string(make([]byte, valueSize))
+	for i := 0; i < keys; i++ {
+		apply(t, s, uint64(i+1), put(fmt.Sprintf("big/%02d", i), big))
+	}
+
+	// Flush first: the bug only shows once values are in files, where reading
+	// a value's header means loading the whole value (42 MiB per List here,
+	// before the metadata index). The counter is process-wide and Pebble works
+	// in the background, so take the smallest of several runs.
+	if err := s.db.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	smallest := ^uint64(0)
+	for run := 0; run < 5; run++ {
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		infos, err := s.List("big/", 0)
+		runtime.ReadMemStats(&after)
+		if err != nil || len(infos) != keys {
+			t.Fatalf("list: %d keys, err %v", len(infos), err)
+		}
+		if infos[3].Version != 4 {
+			t.Fatalf("version = %d, want 4", infos[3].Version)
+		}
+		if d := after.TotalAlloc - before.TotalAlloc; d < smallest {
+			smallest = d
+		}
+	}
+	if smallest > 4<<20 {
+		t.Fatalf("listing %d keys holding %d MiB allocated at least %d MiB; values are being copied",
+			keys, keys*valueSize>>20, smallest>>20)
+	}
+}
+
+func TestExpireIsBounded(t *testing.T) {
+	s := newStore(t)
+	const due = 2500
+	for i := 0; i < due; i++ {
+		apply(t, s, uint64(i+1), putTTL(fmt.Sprintf("k%04d", i), "v", int64(1000+i)))
+	}
+	apply(t, s, due+1, putTTL("later", "v", 900000))
+
+	bounded := func(index uint64) *pb.ApplyResult {
+		return apply(t, s, index, &pb.Command{Op: &pb.Command_Expire{Expire: &pb.Expire{NowMs: 500000, MaxKeys: 1000}}})
+	}
+	for i, want := range []uint32{1000, 1000, 500, 0} {
+		if res := bounded(uint64(due + 2 + i)); res.Expired != want {
+			t.Fatalf("expire command %d removed %d keys, want %d", i+1, res.Expired, want)
+		}
+		if i == 0 {
+			// Oldest first: the first 1000 are gone, the rest are still due.
+			if _, ok := mustGet(t, s, "k0999"); ok {
+				t.Fatal("k0999 should have expired in the first batch")
+			}
+			if _, ok := mustGet(t, s, "k1000"); !ok {
+				t.Fatal("k1000 expired in the first batch; the limit was ignored")
+			}
+		}
+	}
+	if next, _ := s.NextExpiry(); next != 900000 {
+		t.Fatalf("next expiry = %d, want only the later key left", next)
+	}
+}
+
+// Loading a snapshot changes the store without any per-key events, so a
+// watcher must be cut off instead of silently missing those changes.
+func TestRestoreCutsOffWatchers(t *testing.T) {
+	src := newStore(t)
+	apply(t, src, 1, put("a", "1"))
+	snap := src.Snapshot()
+	var buf bytes.Buffer
+	if _, err := snap.WriteTo(&buf); err != nil {
+		t.Fatal(err)
+	}
+	snap.Close()
+
+	dst := newStore(t)
+	events, cancel := dst.Watch("")
+	defer cancel()
+	if err := dst.Restore(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if _, open := <-events; open {
+		t.Fatal("watcher is still subscribed after a snapshot replaced the store")
+	}
+
+	// The hub still works for watchers that subscribe afterwards.
+	again, cancelAgain := dst.Watch("")
+	defer cancelAgain()
+	apply(t, dst, 2, put("b", "2"))
+	if ev := <-again; ev.Key != "b" {
+		t.Fatalf("event after restore: %+v", ev)
+	}
+}
+
+// The metadata index must change with the data in every code path, or List
+// and compare-and-swap would disagree with Get.
+func TestMetadataIndexFollowsData(t *testing.T) {
+	s := newStore(t)
+	apply(t, s, 1, put("a", "1"))
+	apply(t, s, 2, putTTL("b", "2", 1000))
+	apply(t, s, 3, put("c", "3"))
+	apply(t, s, 4, put("a", "1b")) // overwrite: version moves
+	apply(t, s, 5, del("c"))       // delete
+	apply(t, s, 6, expire(2000))   // expire b
+
+	infos, err := s.List("", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 1 || infos[0].Key != "a" || infos[0].Version != 4 {
+		t.Fatalf("list after overwrite, delete and expire: %v", infos)
+	}
+	// A swap against the listed version must succeed, and create-only must
+	// work again for the deleted and the expired key.
+	if res := apply(t, s, 7, cas("a", "1c", infos[0].Version)); res.Status != pb.Status_STATUS_OK {
+		t.Fatalf("swap with the listed version: %v", res)
+	}
+	for i, key := range []string{"b", "c"} {
+		if res := apply(t, s, uint64(8+i), cas(key, "new", 0)); res.Status != pb.Status_STATUS_OK {
+			t.Fatalf("create-only on removed key %s: %v", key, res)
+		}
+	}
+
+	// And it survives a snapshot.
+	snap := s.Snapshot()
+	var buf bytes.Buffer
+	if _, err := snap.WriteTo(&buf); err != nil {
+		t.Fatal(err)
+	}
+	snap.Close()
+	dst := newStore(t)
+	if err := dst.Restore(&buf); err != nil {
+		t.Fatal(err)
+	}
+	restored, _ := dst.List("", 0)
+	if len(restored) != 3 || restored[0].Version != 7 {
+		t.Fatalf("list after restore: %v", restored)
 	}
 }

@@ -32,7 +32,8 @@ type subscriber struct {
 
 // Hub fans changes out to watchers. It never blocks the apply loop: a watcher
 // that falls more than watchBuffer events behind is cut off (its channel is
-// closed) and has to reconnect.
+// closed) and has to reconnect. Watchers are also cut off when the store is
+// replaced by a snapshot, because those changes produce no events.
 type Hub struct {
 	mu   sync.Mutex
 	subs map[*subscriber]struct{}
