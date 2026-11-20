@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
@@ -73,6 +74,11 @@ type Config struct {
 	SnapshotInterval  time.Duration
 	TrailingLogs      uint64
 
+	// NetworkTimeout bounds each Raft dial and network read or write
+	// (default 10s). A peer whose host silently drops packets, instead of
+	// refusing the connection, holds a dial for this long.
+	NetworkTimeout time.Duration
+
 	// ApplyTimeout bounds how long the leader waits to queue a command.
 	ApplyTimeout time.Duration
 	// TickInterval is how often the leader checks for keys due to expire.
@@ -89,6 +95,9 @@ func (c *Config) defaults() {
 	if c.TickInterval == 0 {
 		c.TickInterval = time.Second
 	}
+	if c.NetworkTimeout == 0 {
+		c.NetworkTimeout = 10 * time.Second
+	}
 	if c.LogLevel == "" {
 		c.LogLevel = "warn"
 	}
@@ -103,6 +112,7 @@ type Node struct {
 	Metrics *metrics.Metrics
 
 	store    *store.Store
+	fsm      *fsm
 	raft     *raft.Raft
 	trans    *raft.NetworkTransport
 	logStore *raftboltdb.BoltStore
@@ -112,6 +122,7 @@ type Node struct {
 	raftAddr   string
 	grpcAddr   string
 	needsJoin  bool
+	leaving    atomic.Bool
 
 	connMu sync.Mutex
 	conns  map[string]*grpc.ClientConn
@@ -223,7 +234,7 @@ func (n *Node) startRaft() error {
 	n.trans = raft.NewNetworkTransportWithConfig(&raft.NetworkTransportConfig{
 		Stream:  &streamLayer{Listener: ln, f: n.faults},
 		MaxPool: 3,
-		Timeout: 10 * time.Second,
+		Timeout: n.cfg.NetworkTimeout,
 		Logger:  n.log.Named("raft-net"),
 	})
 
@@ -242,7 +253,22 @@ func (n *Node) startRaft() error {
 		return err
 	}
 
-	n.raft, err = raft.NewRaft(rc, &fsm{store: n.store, metrics: n.Metrics}, n.logStore, n.logStore, snaps, n.trans)
+	// By default Raft reloads the newest snapshot into the state machine on
+	// every start, which here would wipe and rebuild the whole Pebble store,
+	// so restart time would grow with the amount of data. The store is on disk
+	// and knows how far it got, so the reload is only needed when the store is
+	// behind the snapshot: its recent writes are not fsynced and can be lost
+	// in a crash, and the log entries that would replay them may have been
+	// compacted into that snapshot. Otherwise Raft replays the log after the
+	// snapshot and Store.Apply skips what it already holds.
+	if metas, err := snaps.List(); err != nil {
+		return fmt.Errorf("list snapshots: %w", err)
+	} else if len(metas) > 0 && n.store.AppliedIndex() >= metas[0].Index {
+		rc.NoSnapshotRestoreOnStart = true
+	}
+
+	n.fsm = &fsm{store: n.store, metrics: n.Metrics}
+	n.raft, err = raft.NewRaft(rc, n.fsm, n.logStore, n.logStore, snaps, n.trans)
 	if err != nil {
 		return fmt.Errorf("start raft: %w", err)
 	}
@@ -329,6 +355,9 @@ func (n *Node) leaderLoop() {
 }
 
 func (n *Node) ensureSelfRegistered(ctx context.Context) {
+	if n.leaving.Load() {
+		return // this node is removing itself; do not put its entry back
+	}
 	me := n.self()
 	if cur, ok, err := n.store.Member(n.cfg.ID); err == nil && ok && proto.Equal(cur, me) {
 		return
@@ -339,15 +368,25 @@ func (n *Node) ensureSelfRegistered(ctx context.Context) {
 	}
 }
 
+// Expiry is done in bounded commands. One command that deleted a million due
+// keys would hold the apply loop of every node for as long as that takes.
+const (
+	expireBatchKeys  = 1000 // keys per Expire command
+	expireMaxPerTick = 20   // commands per tick, so a backlog drains at 20k keys per tick
+)
+
 func (n *Node) expireDueKeys(ctx context.Context) {
-	next, err := n.store.NextExpiry()
 	now := time.Now().UnixMilli()
-	if err != nil || next == 0 || next > now {
-		return // nothing is due: do not fill the log with empty commands
-	}
-	cmd := &pb.Command{Op: &pb.Command_Expire{Expire: &pb.Expire{NowMs: now}}}
-	if _, err := n.applyLocal(ctx, cmd); err != nil {
-		n.log.Debug("expire failed", "error", err)
+	for i := 0; i < expireMaxPerTick; i++ {
+		next, err := n.store.NextExpiry()
+		if err != nil || next == 0 || next > now {
+			return // nothing is due: do not fill the log with empty commands
+		}
+		cmd := &pb.Command{Op: &pb.Command_Expire{Expire: &pb.Expire{NowMs: now, MaxKeys: expireBatchKeys}}}
+		if _, err := n.applyLocal(ctx, cmd); err != nil {
+			n.log.Debug("expire failed", "error", err)
+			return
+		}
 	}
 }
 
@@ -586,10 +625,31 @@ func (n *Node) Remove(ctx context.Context, id string) error {
 	if n.raft.State() != raft.Leader {
 		return raft.ErrNotLeader
 	}
+	forget := &pb.Command{Op: &pb.Command_RemoveMember{RemoveMember: &pb.RemoveMember{Id: id}}}
+	if id == n.cfg.ID {
+		// The leader removing itself stops being leader the moment the change
+		// commits, so it cannot write anything afterwards. Drop its entry from
+		// the member table first, then leave. (Done in the other order, the
+		// removal worked but the entry stayed behind and the caller was told
+		// to "send this to the leader".)
+		// The leader loop re-registers this node whenever its entry is missing,
+		// and it is still the leader until the removal commits. Tell it to stop
+		// first, or it can put the entry straight back.
+		n.leaving.Store(true)
+		if _, err := n.applyLocal(ctx, forget); err != nil {
+			n.leaving.Store(false)
+			return err
+		}
+		if err := waitFuture(ctx, n.raft.RemoveServer(raft.ServerID(id), 0, n.cfg.ApplyTimeout)); err != nil {
+			n.leaving.Store(false)
+			return err
+		}
+		return nil
+	}
 	if err := waitFuture(ctx, n.raft.RemoveServer(raft.ServerID(id), 0, n.cfg.ApplyTimeout)); err != nil {
 		return err
 	}
-	_, err = n.applyLocal(ctx, &pb.Command{Op: &pb.Command_RemoveMember{RemoveMember: &pb.RemoveMember{Id: id}}})
+	_, err = n.applyLocal(ctx, forget)
 	return err
 }
 
@@ -660,6 +720,28 @@ func (n *Node) Status() Status {
 	}
 	return st
 }
+
+// MemberTable returns the ids recorded in the replicated member table.
+func (n *Node) MemberTable() ([]string, error) {
+	leave, err := n.enter()
+	if err != nil {
+		return nil, err
+	}
+	defer leave()
+	members, err := n.store.Members()
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(members))
+	for _, m := range members {
+		ids = append(ids, m.Id)
+	}
+	return ids, nil
+}
+
+// SnapshotRestores counts how many times this node replaced its whole store
+// with a snapshot since it started.
+func (n *Node) SnapshotRestores() uint64 { return n.fsm.restores.Load() }
 
 func (n *Node) ID() string       { return n.cfg.ID }
 func (n *Node) IsLeader() bool   { return n.raft.State() == raft.Leader }

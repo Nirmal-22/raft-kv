@@ -42,6 +42,11 @@ func (n *Node) dropWhenIsolated(ctx context.Context, req any, _ *grpc.UnaryServe
 	return handler(ctx, req)
 }
 
+// maxForwardedReply bounds a reply from the leader. gRPC's default is 4 MiB,
+// which a List of 10,000 keys of up to 1 KiB each (about 10 MiB) exceeds: the
+// request worked when sent to the leader and failed when sent to a follower.
+const maxForwardedReply = 32 << 20
+
 // client returns a cached gRPC connection to another node.
 func (n *Node) client(addr string) (pb.ClusterClient, error) {
 	if n.faults.Isolated() {
@@ -56,6 +61,7 @@ func (n *Node) client(addr string) (pb.ClusterClient, error) {
 		conn, err = grpc.NewClient(addr,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 			grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
+			grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxForwardedReply)),
 		)
 		if err != nil {
 			return nil, err

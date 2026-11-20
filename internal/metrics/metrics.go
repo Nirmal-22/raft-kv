@@ -18,6 +18,8 @@ type Metrics struct {
 	LeaderChanges prometheus.Counter
 	KeysExpired   prometheus.Counter
 	Watchers      prometheus.Gauge
+
+	SnapshotRestores prometheus.Counter
 }
 
 func New() *Metrics {
@@ -56,9 +58,13 @@ func New() *Metrics {
 			Help: "Open watch streams on this node.",
 		}),
 	}
+	m.SnapshotRestores = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "raftkv_snapshot_restores_total",
+		Help: "Times the whole local store was replaced by a snapshot.",
+	})
 	reg.MustRegister(
 		m.HTTPDuration, m.ApplyDuration, m.ReadDuration, m.Forwarded,
-		m.LeaderChanges, m.KeysExpired, m.Watchers,
+		m.LeaderChanges, m.KeysExpired, m.Watchers, m.SnapshotRestores,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)

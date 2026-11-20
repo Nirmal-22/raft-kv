@@ -2,14 +2,17 @@ package httpapi
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,14 +21,27 @@ import (
 	"github.com/Nirmal-22/raft-kv/internal/node"
 )
 
+// nextPort hands out ports below Linux's ephemeral range. A port from that
+// range can be taken as the source port of an outgoing connection between
+// "reserve" and "bind" (this made the cluster tests flaky before they
+// switched). The range here does not overlap the one the cluster tests use.
+var nextPort atomic.Int32
+
+func init() { nextPort.Store(int32(30000 + (os.Getpid()%100)*20)) }
+
 func freeAddr(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	for i := 0; i < 200; i++ {
+		addr := fmt.Sprintf("127.0.0.1:%d", nextPort.Add(1))
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			continue
+		}
+		ln.Close()
+		return addr
 	}
-	defer ln.Close()
-	return ln.Addr().String()
+	t.Fatal("no free port found")
+	return ""
 }
 
 // newServer starts a one-node cluster behind the real HTTP handler.
@@ -261,6 +277,26 @@ func TestWatchStreamsChanges(t *testing.T) {
 	}
 	if l := next(); l != "event: delete" {
 		t.Fatalf("second event line: %q", l)
+	}
+	next() // the delete event's data line
+
+	// A value that is not valid UTF-8 cannot be a JSON string. It must arrive
+	// intact as base64, not with its bytes replaced.
+	binary := string([]byte{0xff, 0x00, 0xfe, 'o', 'k'})
+	do(t, srv, http.MethodPut, "/v1/kv/jobs/bin", binary)
+	if l := next(); l != "event: put" {
+		t.Fatalf("binary put event line: %q", l)
+	}
+	var bin struct {
+		Value       *string `json:"value"`
+		ValueBase64 string  `json:"value_base64"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(next(), "data: ")), &bin); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(bin.ValueBase64)
+	if err != nil || string(decoded) != binary || bin.Value != nil {
+		t.Fatalf("binary value in watch event: value=%v base64=%q decoded=%q", bin.Value, bin.ValueBase64, decoded)
 	}
 }
 

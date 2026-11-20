@@ -4,6 +4,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/hashicorp/raft"
@@ -218,7 +220,8 @@ func (a *api) list(c *gin.Context) {
 
 // watch streams changes as Server-Sent Events. It reports what this node
 // applies, so a lagging follower delivers events late. A client that falls
-// too far behind is disconnected and must reconnect; events are not replayed.
+// too far behind, or whose node loads a snapshot, gets a final "dropped" event
+// and must re-read and reconnect; events are not replayed.
 func (a *api) watch(c *gin.Context) {
 	events, cancel := a.n.Watch(c.Query("prefix"))
 	defer cancel()
@@ -240,13 +243,19 @@ func (a *api) watch(c *gin.Context) {
 			fmt.Fprint(c.Writer, ": ping\n\n")
 		case ev, open := <-events:
 			if !open {
-				fmt.Fprint(c.Writer, "event: dropped\ndata: {\"reason\":\"fell too far behind; reconnect\"}\n\n")
+				fmt.Fprint(c.Writer, "event: dropped\ndata: {\"reason\":\"events were missed (fell behind, or this node loaded a snapshot); re-read and reconnect\"}\n\n")
 				c.Writer.Flush()
 				return
 			}
 			payload := map[string]any{"key": ev.Key, "version": ev.Version}
 			if ev.Type == "put" {
-				payload["value"] = string(ev.Value)
+				// JSON strings must be valid UTF-8. Anything else goes out
+				// base64-encoded instead of being silently altered.
+				if utf8.Valid(ev.Value) {
+					payload["value"] = string(ev.Value)
+				} else {
+					payload["value_base64"] = base64.StdEncoding.EncodeToString(ev.Value)
+				}
 			}
 			data, _ := json.Marshal(payload)
 			fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", ev.Type, data)

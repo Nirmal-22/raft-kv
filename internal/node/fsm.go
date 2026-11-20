@@ -3,6 +3,7 @@ package node
 import (
 	"fmt"
 	"io"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/raft"
@@ -16,8 +17,9 @@ import (
 // fsm connects Raft to the store. Raft calls Apply once an entry is committed
 // (stored on a majority of nodes), in log order, on every node.
 type fsm struct {
-	store   *store.Store
-	metrics *metrics.Metrics
+	store    *store.Store
+	metrics  *metrics.Metrics
+	restores atomic.Uint64
 }
 
 var _ raft.FSM = (*fsm)(nil)
@@ -51,6 +53,8 @@ func (f *fsm) Snapshot() (raft.FSMSnapshot, error) {
 
 func (f *fsm) Restore(rc io.ReadCloser) error {
 	defer rc.Close()
+	f.restores.Add(1)
+	f.metrics.SnapshotRestores.Inc()
 	return f.store.Restore(rc)
 }
 

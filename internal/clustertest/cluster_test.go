@@ -219,10 +219,16 @@ func TestNewNodeCatchesUpFromSnapshot(t *testing.T) {
 	for i := 0; i < keys; i++ {
 		mustPut(t, leader, fmt.Sprintf("snap/%03d", i), fmt.Sprintf("v%d", i))
 	}
-	leaderDir := c.cfgs[c.leaderIndex()].DataDir
-	eventually(t, 10*time.Second, "the leader compacts its log into a snapshot", func() bool {
-		entries, _ := os.ReadDir(filepath.Join(leaderDir, "snapshots"))
-		return len(entries) > 0
+	// Wait for every node, not only the current leader: if leadership moves
+	// before the new node joins, the new leader must have compacted too, or it
+	// could bring the newcomer up to date from its log alone.
+	eventually(t, 10*time.Second, "every node compacts its log into a snapshot", func() bool {
+		for _, cfg := range c.cfgs {
+			if entries, _ := os.ReadDir(filepath.Join(cfg.DataDir, "snapshots")); len(entries) == 0 {
+				return false
+			}
+		}
+		return true
 	})
 
 	// The log no longer reaches back to the start, so a brand-new node can

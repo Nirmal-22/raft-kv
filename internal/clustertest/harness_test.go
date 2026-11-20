@@ -83,8 +83,12 @@ func (c *cluster) add(tweak func(*node.Config)) int {
 		LeaderLeaseTimeout: 100 * time.Millisecond,
 		CommitTimeout:      5 * time.Millisecond,
 		ApplyTimeout:       2 * time.Second,
-		TickInterval:       30 * time.Millisecond,
-		LogLevel:           logLevel,
+		// On some machines (WSL with mirrored networking is one) a connection
+		// to a port nobody listens on hangs instead of being refused. With the
+		// 10s default, every shutdown next to a stopped node took 10s.
+		NetworkTimeout: 500 * time.Millisecond,
+		TickInterval:   30 * time.Millisecond,
+		LogLevel:       logLevel,
 	}
 	if i > 0 {
 		// Every later node knows every earlier one, so a join still works
